@@ -1,0 +1,147 @@
+# %% ResNet18：CIFAR-10、GPU
+
+import torch
+import torch.nn as nn
+import torchvision
+import torchvision.transforms as transforms
+from torchvision.models import resnet18
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, random_split
+import onnx
+import torch.onnx
+from torchsummary import summary
+import time
+
+
+trans_train = transforms.Compose([
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomCrop(32, padding=4),
+    transforms.ToTensor(),
+    transforms.Normalize(mean = (0.485, 0.456, 0.406), std = (0.229, 0.224, 0.225))
+])
+trans = transforms.Compose([
+    transforms.RandomCrop(32, padding=4),
+    transforms.ToTensor(),
+    transforms.Normalize(mean = (0.485, 0.456, 0.406), std = (0.229, 0.224, 0.225))
+])
+
+train_dataset = torchvision.datasets.CIFAR10(root='./data/public', train=True, transform=trans_train, download=False)
+test_dataset = torchvision.datasets.CIFAR10(root='./data/public', train=False, transform=trans, download=False)
+
+train_size = int(0.8 * len(train_dataset))
+val_size = len(train_dataset) - train_size
+train_dataset, val_dataset = random_split(train_dataset, [train_size, val_size])
+
+train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
+
+model = resnet18(weights = None) # 'ResNet18_Weights.DEFAULT'
+# 修改最后一层以适应CIFAR-10的类别数
+# summary(model, input_size = (3, 32, 32))
+num_ftrs = model.fc.in_features
+model.fc = nn.Linear(num_ftrs, 10)  # CIFAR-10有10个类别
+# summary(model, input_size = (3, 32, 32))
+# 模型优化：将7*7的卷积核改成3*3，步长和padding改成1，取消最大池化层
+# 原模型20次迭代准确率：82.81-->86.99,40次迭代后为88.30
+model.conv1 = nn.Conv2d(3, 64, kernel_size = 3, stride = 1, padding = 1, bias = False)
+model.maxpool = nn.MaxPool2d(kernel_size=1, stride=1, padding=0)
+summary(model, input_size = (3, 32, 32))
+
+# 权重移入GPU
+# 如果有多个 GPU，使用 nn.DataParallel 包装模型
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
+if torch.cuda.device_count() > 1:
+    model = nn.DataParallel(model)
+model.to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
+
+# 训练模型的函数
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs: int = 10) -> None:
+    for epoch in range(num_epochs):
+        model.train()  # 将模型设置为训练模式
+        running_loss = 0.0
+        
+        start_time = time.time()
+        # 遍历训练集数据加载器
+        for inputs, labels in train_loader:
+            # 输入输出移入GPU
+            inputs, labels = inputs.to(device), labels.to(device)
+            
+            optimizer.zero_grad()  # 梯度清零
+            outputs = model(inputs)  # 使用模型进行前向传播
+            loss = criterion(outputs, labels)  # 计算损失
+            loss.backward()  # 反向传播，计算梯度
+            optimizer.step()  # 更新模型参数
+            running_loss += loss.item()  # 累积损失
+        
+        model.eval()  # 将模型设置为评估模式
+        val_loss = 0.0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            # 遍历验证集数据加载器
+            for inputs, labels in val_loader:
+                # 输入输出移入GPU
+                inputs, labels = inputs.to(device), labels.to(device)
+                
+                outputs = model(inputs)  # 使用模型进行前向传播
+                loss = criterion(outputs, labels)  # 计算损失
+                val_loss += loss.item()  # 累积验证损失
+                _, predicted = torch.max(outputs, 1)  # 计算预测结果
+                total += labels.size(0)  # 累积样本总数
+                correct += (predicted == labels).sum().item()  # 累积正确预测的数量
+        
+        # 打印训练和验证信息
+        use_time = time.time() - start_time
+        print(f'Epoch {epoch+1}/{num_epochs}, '
+              f'Time {use_time}, '
+              f'Training Loss: {running_loss / len(train_loader):.4f}, '
+              f'Validation Loss: {val_loss / len(val_loader):.4f}, '
+              f'Validation Accuracy: {(100 * correct / total):.2f}%')
+        
+        # 每十次迭代保存模型，减小学习率lr
+        if epoch % 20 == 0:
+            torch.save(model.state_dict(), f'my_model{epoch}.bin')
+            optimizer.param_groups[0]['lr'] = optimizer.param_groups[0]['lr'] * 0.5
+
+# 评估模型的函数
+def evaluate_model(model, test_loader, criterion) -> None:
+    model.eval()  # 将模型设置为评估模式
+    test_loss = 0.0
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        # 遍历测试集数据加载器
+        for inputs, labels in test_loader:
+            # 输入输出移入GPU
+            inputs, labels = inputs.to(device), labels.to(device)
+            
+            outputs = model(inputs)  # 使用模型进行前向传播
+            loss = criterion(outputs, labels)  # 计算损失
+            test_loss += loss.item()  # 累积测试损失
+            _, predicted = torch.max(outputs, 1)  # 计算预测结果
+            total += labels.size(0)  # 累积样本总数
+            correct += (predicted == labels).sum().item()  # 累积正确预测的数量
+    
+    # 打印测试信息
+    print(f'Test Loss: {test_loss / len(test_loader):.4f}')
+    print(f'Test Accuracy: {(100 * correct / total):.2f}%')
+
+train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=250)
+evaluate_model(model, test_loader, criterion)
+# 保存模型为二进制格式
+torch.save(model.state_dict(), 'my_model.bin')
+# 将PyTorch模型转换为ONNX格式
+dummy_input = torch.randn(1, 3, 32, 32)  # 示例输入
+onnx_model_path = "my_model.onnx"
+torch.onnx.export(model, dummy_input, onnx_model_path)
+# 加载ONNX模型并准备成TensorFlow可调用的版本
+onnx_model = onnx.load(onnx_model_path)
+tf_rep = prepare(onnx_model)
+pytorch_model = tf_rep.pytorch_model
